@@ -1,77 +1,98 @@
 import streamlit as st
 import pandas as pd
+import json
+import requests
+from msal import ConfidentialClientApplication
 
-# Cargar archivos privados de manera segura
-@st.cache_data
-def load_private_files():
-    maestro_moleculas_df = pd.read_excel('Maestro_Moleculas.xlsx')
-    inventario_api_df = pd.read_excel('Inventario.xlsx')
-    return maestro_moleculas_df, inventario_api_df
+# Configuración de autenticación para Power BI
+TENANT_ID = "tu-tenant-id"
+CLIENT_ID = "tu-client-id"
+CLIENT_SECRET = "tu-client-secret"
+POWER_BI_GROUP_ID = "tu-grupo-id"  # ID del espacio de trabajo de Power BI
+DATASET_NAME = "MiDataset"
 
-# Función para procesar el archivo de faltantes y generar el resultado
-def procesar_faltantes(faltantes_df, maestro_moleculas_df, inventario_api_df):
-    faltantes_df.columns = faltantes_df.columns.str.lower().str.strip()
-    maestro_moleculas_df.columns = maestro_moleculas_df.columns.str.lower().str.strip()
-    inventario_api_df.columns = inventario_api_df.columns.str.lower().str.strip()
-
-    cur_faltantes = faltantes_df['cur'].unique()
-    codart_faltantes = faltantes_df['codart'].unique()
-
-    alternativas_df = maestro_moleculas_df[maestro_moleculas_df['cur'].isin(cur_faltantes)]
-
-    alternativas_inventario_df = pd.merge(
-        alternativas_df,
-        inventario_api_df,
-        on='cur',
-        how='inner',
-        suffixes=('_alternativas', '_inventario')
+def authenticate_with_powerbi():
+    """
+    Autenticarse con Power BI usando MSAL.
+    """
+    app = ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        client_credential=CLIENT_SECRET
     )
+    token_response = app.acquire_token_for_client(scopes=["https://analysis.windows.net/powerbi/api/.default"])
+    if "access_token" in token_response:
+        return token_response["access_token"]
+    else:
+        st.error("Error autenticando con Power BI.")
+        return None
 
-    alternativas_disponibles_df = alternativas_inventario_df[
-        (alternativas_inventario_df['cantidad'] > 0) &
-        (alternativas_inventario_df['codart_alternativas'].isin(codart_faltantes))
-    ]
+def upload_to_powerbi(df, access_token):
+    """
+    Subir datos a Power BI como un dataset en un espacio de trabajo.
+    """
+    # Crear un payload con los datos del DataFrame
+    payload = {
+        "name": DATASET_NAME,
+        "tables": [
+            {
+                "name": "Table1",
+                "columns": [{"name": col, "dataType": "string"} for col in df.columns],
+                "rows": df.to_dict(orient="records"),
+            }
+        ],
+    }
 
-    columnas_deseadas = [
-        'codart_alternativas', 'cur', 'opcion_inventario', 'codart_inventario', 'cantidad', 'bodega'
-    ]
-    columnas_presentes = [col for col in columnas_deseadas if col in alternativas_disponibles_df.columns]
-    alternativas_disponibles_df = alternativas_disponibles_df[columnas_presentes]
+    # Endpoint para crear o actualizar un dataset
+    url = f"https://api.powerbi.com/v1.0/myorg/groups/{POWER_BI_GROUP_ID}/datasets"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
-    alternativas_disponibles_df.rename(columns={
-        'codart_alternativas': 'codart_faltante',
-        'opcion_inventario': 'opcion_alternativa',
-        'codart_inventario': 'codart_alternativa'
-    }, inplace=True)
+    response = requests.post(url, json=payload, headers=headers)
 
-    resultado_final_df = pd.merge(
-        faltantes_df[['cur', 'codart']],
-        alternativas_disponibles_df,
-        left_on=['cur', 'codart'],
-        right_on=['cur', 'codart_faltante'],
-        how='inner'
-    )
+    if response.status_code == 201:
+        st.success("¡Datos subidos con éxito a Power BI!")
+    else:
+        st.error(f"Error subiendo datos: {response.text}")
 
-    return resultado_final_df
+# Configuración de la página
+st.set_page_config(page_title="Convertidor JSON a Power BI", layout="wide")
 
-# Streamlit UI
-st.title('Generador de Alternativas de Faltantes')
+# Título
+st.title("Convertidor de JSON a Power BI con Integración REST API")
 
-uploaded_file = st.file_uploader("Sube tu archivo de faltantes", type="xlsx")
+# Subida de archivo JSON
+uploaded_file = st.file_uploader("Sube tu archivo JSON aquí:", type=["json"])
 
-if uploaded_file:
-    faltantes_df = pd.read_excel(uploaded_file)
-    maestro_moleculas_df, inventario_api_df = load_private_files()
+if uploaded_file is not None:
+    st.success("¡Archivo subido con éxito!")
+    st.write("Procesando archivo...")
+    
+    # Procesar el archivo JSON
+    try:
+        data = json.load(uploaded_file)
+        if isinstance(data, dict):
+            df = pd.json_normalize(data)
+        elif isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            st.error("El formato JSON no es válido para la conversión a tabla.")
+            df = None
+    except Exception as e:
+        st.error(f"Error procesando el archivo JSON: {e}")
+        df = None
 
-    resultado_final_df = procesar_faltantes(faltantes_df, maestro_moleculas_df, inventario_api_df)
+    if df is not None:
+        st.write("Vista previa de los datos procesados:")
+        st.dataframe(df.head(10))  # Mostrar las primeras 10 filas
+        
+        # Opción para subir a Power BI
+        if st.button("Subir a Power BI"):
+            st.write("Autenticando con Power BI...")
+            access_token = authenticate_with_powerbi()
+            if access_token:
+                st.write("Subiendo datos a Power BI...")
+                upload_to_powerbi(df, access_token)
 
-    st.write("Archivo procesado correctamente.")
-    st.dataframe(resultado_final_df)
-
-    # Botón para descargar el archivo generado
-    st.download_button(
-        label="Descargar archivo de alternativas",
-        data=resultado_final_df.to_excel(index=False, engine='openpyxl'),
-        file_name='alternativas_disponibles.xlsx',
-        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
+# Footer
+st.markdown("---")
+st.caption("Desarrollado con ❤️ usando Streamlit y Power BI REST API.")
